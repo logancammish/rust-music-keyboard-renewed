@@ -1,3 +1,8 @@
 {
-    "info_popup": true
+  "info_popup": true,
+  "default_hold_mode": true,
+  "attack_ms": 12,
+  "release_ms": 160,
+  "master_gain": 0.18,
+  "output_dir": ""
 }

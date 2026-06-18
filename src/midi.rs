@@ -1,12 +1,58 @@
 use midly::{Format, Header, MetaMessage, MidiMessage, Smf, Timing, Track, TrackEvent};
 use midly::num::{u28, u24, u7, u4};
-use std::io::Write;
 use std::env;
-use std::fs::{self, File};
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use crate::{Note, Song};
 
 pub struct Midi {}
+
+// Default per-platform output directory, used when no custom directory is set.
+fn default_output_dir() -> PathBuf {
+    if cfg!(target_os = "windows") {
+        let home = env::var("USERPROFILE")
+            .or_else(|_| env::var("USERNAME").map(|u| format!("C:\\Users\\{u}")))
+            .unwrap_or_else(|_| "C:\\Users\\Default".to_string());
+        PathBuf::from(home)
+            .join("Documents")
+            .join("RustMusicKeyboardRenewed")
+    } else if cfg!(target_os = "linux") {
+        PathBuf::from("/tmp/RustMusicKeyboardRenewed")
+    } else {
+        PathBuf::from("./RustMusicKeyboardRenewed")
+    }
+}
+
+// Strip anything that isn't safe in a file name and fall back to a default.
+fn sanitize_file_name(name: &str) -> String {
+    let cleaned: String = name
+        .trim()
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' { c } else { '_' })
+        .collect();
+    let cleaned = cleaned.trim().to_string();
+    if cleaned.is_empty() {
+        "recording".to_string()
+    } else {
+        cleaned
+    }
+}
+
+// Resolve a unique path inside `dir` for `<name>.mid`, appending " (n)" if a
+// file with that name already exists so each recording becomes its own file.
+fn unique_path(dir: &Path, name: &str) -> PathBuf {
+    let candidate = dir.join(format!("{name}.mid"));
+    if !candidate.exists() {
+        return candidate;
+    }
+    for n in 2..10_000 {
+        let candidate = dir.join(format!("{name} ({n}).mid"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    dir.join(format!("{name}.mid"))
+}
 
 // impliment for Midi
 // functions: 
@@ -39,7 +85,11 @@ impl Midi {
         u24::from((60_000_000.0 / bpm) as u32)
     }
 
-    pub fn midi_file_create(song: Song) {
+    // Serialises `song` to a `.mid` file. The directory comes from settings
+    // (or a platform default when blank) and the file name is supplied by the
+    // user; a unique suffix is added so existing recordings are never
+    // overwritten. Returns the path written, if successful.
+    pub fn midi_file_create(song: Song, output_dir: &str, file_name: &str) -> Option<PathBuf> {
         let header = Header::new(Format::SingleTrack, Timing::Metrical(480.into()));
         let mut smf = Smf::new(header);
     
@@ -58,7 +108,7 @@ impl Midi {
                 continue;
             }
             
-            let midi_note = Self::note_to_midi(note.clone(), *octave);
+            let midi_note = Self::note_to_midi(*note, *octave);
             let beats_per_second = song.bpm / 60.0;
             let start_ticks = (start_time * beats_per_second * 480.0).round() as u32;
             let duration_ticks = (duration * beats_per_second * 480.0).round() as u32;
@@ -98,31 +148,31 @@ impl Midi {
         }
     
         smf.tracks.push(track);
-        
-        let output_file: PathBuf;
 
-        if cfg!(target_os = "windows") {
-            let username = env::var("USERNAME").expect("Failed to get USERNAME environment variable");
-            let mut output_dir = PathBuf::from("C:\\Users");
-            output_dir.push(username);
-            output_dir.push("Documents\\RustMusicKeyboard");
-            fs::create_dir_all(&output_dir).expect("Failed to create directory");
-            output_file = output_dir.join("output.mid");
-    
-        } else if cfg!(target_os = "linux") {
-            output_file = PathBuf::from("/tmp/output.mid");
-    
+        let dir = if output_dir.trim().is_empty() {
+            default_output_dir()
         } else {
-            output_file = PathBuf::from("output.mid");
+            PathBuf::from(output_dir.trim())
+        };
+
+        if let Err(e) = fs::create_dir_all(&dir) {
+            eprintln!("Failed to create output directory {dir:?}: {e}");
+            return None;
         }
-    
 
-        let buffer = Vec::new();
-        File::create(&output_file)
-            .expect("Failed to create file")
-            .write_all(&buffer)
-            .expect("Failed to write to file");
+        let output_file = unique_path(&dir, &sanitize_file_name(file_name));
 
-        println!("MIDI file saved at: {:?}", output_file);
+        // Actually serialise the song to disk. The original version wrote an
+        // empty buffer here, so every exported file was 0 bytes.
+        match smf.save(&output_file) {
+            Ok(()) => {
+                println!("MIDI file saved at: {output_file:?}");
+                Some(output_file)
+            }
+            Err(e) => {
+                eprintln!("Failed to save MIDI file: {e}");
+                None
+            }
+        }
     }
 }

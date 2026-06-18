@@ -4,53 +4,60 @@ mod gui;
 mod chord;
 mod midi;
 mod note;
-use gui::{*};
-use chord::{*};
-use note::{*};
+mod settings;
+use gui::*;
+use chord::*;
+use note::*;
+use settings::Settings;
 
-
-// use dependencies     
-use iced::{keyboard::{self}, Element, Size, Subscription, Theme};
+// use dependencies
+use iced::{keyboard, time, Element, Size, Subscription, Theme};
 use once_cell::sync::Lazy;
-use rodio::{self, OutputStream, OutputStreamHandle, Sink, Source};
-use std::{fs, io::Read};
-use std::{thread, collections::HashMap, fs::File,  sync::{Arc, Mutex}, time::Duration};
-use iced::futures::{self, Stream};
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use futures::stream::StreamExt;
-use iced_native::subscription::Recipe;
-use serde_json;
+use rodio::mixer::Mixer;
+use rodio::stream::DeviceSinkBuilder;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
 
-#[derive(Clone)]
-struct SoundRequest {
-    frequency: u32,
-    duration: f32,
-    volume: f32,
-    real_note: RealNote,
-    bpm: f32
+// How often the UI ticks. Drives the recording timer and the key/record
+// animations, so it runs at roughly 60 fps for smooth motion.
+const TICK: std::time::Duration = std::time::Duration::from_millis(16);
+// Seconds for a key's highlight to fade out after it is released.
+const GLOW_FADE: f32 = 0.28;
+
+// The audio output stream owns a non-`Send` `cpal::Stream`, so it has to live
+// on its own thread. We park that thread forever to keep the stream alive and
+// hand the (cloneable, `Send + Sync`) mixer back to the rest of the program.
+// Every voice is queued onto this single mixer, which gives us polyphony for
+// free without spawning a thread per note.
+static AUDIO: Lazy<Mixer> = Lazy::new(|| {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        match DeviceSinkBuilder::open_default_sink() {
+            Ok(stream) => {
+                let _ = tx.send(Some(stream.mixer().clone()));
+                std::thread::park();
+                drop(stream);
+            }
+            Err(e) => {
+                eprintln!("Failed to open audio output: {e}");
+                let _ = tx.send(None);
+            }
+        }
+    });
+
+    rx.recv()
+        .ok()
+        .flatten()
+        .expect("audio output stream could not be initialised")
+});
+
+pub fn audio_mixer() -> &'static Mixer {
+    &AUDIO
 }
-
-// playable trait to implement polymorphism
-// for structs RealNote and Chordf
-trait Playable {
-    fn play(&self, bpm: f32, is_recording: bool, volume: f32);
-}
-
-// Mutually exclusive, thread-safe static variables for storing important 
-// information which needs to be used throughout the program
-static RECORDED_NOTES: Lazy<Arc<Mutex<HashMap<Note, Vec<(f32, f32, f32)>>>>> = Lazy::new(|| {
-    Arc::new(Mutex::new(HashMap::new()))
-});
-static RECORDING_START_TIME: Lazy<Arc<Mutex<Option<std::time::Instant>>>> = Lazy::new(|| {
-    Arc::new(Mutex::new(None))
-});
-const THREAD_POOL: Lazy<Arc<Mutex<rayon::ThreadPool>>> = Lazy::new(|| {
-    Arc::new(Mutex::new(rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap()))
-});
-
-
-
 
 #[derive(Debug, Clone)]
 struct Song {
@@ -58,451 +65,495 @@ struct Song {
     bpm: f32,
 }
 
-impl Default for Song { 
-    fn default() -> Self {
-        Self {
-            bpm: 120.0,
-            notes: vec![]
+// Tracks timing metadata for the current recording. This runs entirely on the
+// UI thread (driven by Play/EndPlaying messages), so it no longer needs the
+// shared, mutex-guarded statics the old version relied on.
+#[derive(Default)]
+struct Recording {
+    start: Option<Instant>,
+    events: Vec<(Note, f32, f32, f32)>,
+    pending: HashMap<Note, (f32, f32)>, // note -> (octave, start_time)
+}
+
+impl Recording {
+    fn is_active(&self) -> bool {
+        self.start.is_some()
+    }
+
+    fn elapsed(&self) -> f32 {
+        self.start.map(|s| s.elapsed().as_secs_f32()).unwrap_or(0.0)
+    }
+
+    fn begin(&mut self) {
+        self.start = Some(Instant::now());
+        self.events.clear();
+        self.pending.clear();
+    }
+
+    // A note whose length is determined by how long it is held.
+    fn note_on(&mut self, note: Note, octave: f32) {
+        if self.is_active() {
+            self.pending.insert(note, (octave, self.elapsed()));
         }
     }
-}
 
-pub fn async_play_note(notes: &[RealNote], bpm: f32, is_recording: bool, volume: f32) {
-    for note in notes {
-        let note = note.clone();
-        //THREAD_POOL.lock().unwrap().execute(move || note.play_sound(bpm, is_recording, sink));
+    fn note_off(&mut self, note: Note) {
+        if !self.is_active() {
+            return;
+        }
+        if let Some((octave, start)) = self.pending.remove(&note) {
+            let duration = (self.elapsed() - start).max(0.05);
+            self.events.push((note, octave, start, duration));
+        }
+    }
 
-        THREAD_POOL.lock().unwrap().spawn(move || {
-            note.play(bpm, is_recording, volume);
-        });
-        // thread::spawn(move || {
-        //     note.play(bpm, is_recording, volume);
-        // });
+    // A note with a predetermined length.
+    fn note_fixed(&mut self, note: Note, octave: f32, duration: f32) {
+        if self.is_active() {
+            self.events.push((note, octave, self.elapsed(), duration));
+        }
+    }
+
+    fn finish(&mut self, bpm: f32) -> Song {
+        // Close any notes still being held when recording stopped.
+        let pending: Vec<Note> = self.pending.keys().copied().collect();
+        for note in pending {
+            self.note_off(note);
+        }
+        let song = Song {
+            notes: std::mem::take(&mut self.events),
+            bpm,
+        };
+        self.start = None;
+        song
     }
 }
 
-pub fn record_history(real_note: RealNote, time: f32) { 
-    let recording_start_guard = RECORDING_START_TIME.lock().unwrap();
-    if let Some(start_time) = &*recording_start_guard {
-        let elapsed = start_time.elapsed().as_secs_f32();
-        let mut recorded_notes = RECORDED_NOTES.lock().unwrap();
-        recorded_notes.entry(real_note.note.clone())
-            .or_insert_with(Vec::new)
-            .push((real_note.octave, elapsed, time)); // (octave, start_time, duration)
-    }
+// A note (or chord) currently sounding in hold mode.
+struct ActiveNote {
+    gates: Vec<Arc<AtomicBool>>,
+    recorded: Vec<Note>,
 }
 
-// Message enum 
+// Message enum
 #[derive(Debug, Clone, PartialEq)]
-enum Message { 
-    Scale(Note), 
+enum Message {
+    Scale(Note),
+    ScaleTypeChange(ScaleType),
     OctaveChange(f32),
     BpmChange(f32),
     CustomBpmChange(String),
-    Play(Note, bool), // True if played with gui
+    Play(Note),
     EndPlaying(Note),
     KeyPressed(iced::keyboard::Key),
     KeyReleased(iced::keyboard::Key),
-    PlayChords,
-    PlayAsync,
-    ToggleRecoring,
+    ToggleChords,
+    ToggleHold,
+    ToggleRecording,
     NoteLengthChange(f32),
     VolumeChange(f32),
-    ToggleHelpGUI,
-    Tick
+    FileNameChange(String),
+    SwitchMenu(CurrentMenu),
+    // Advanced settings
+    SetInfoPopup(bool),
+    SetDefaultHold(bool),
+    AttackChange(f32),
+    ReleaseChange(f32),
+    GainChange(f32),
+    OutputDirChange(String),
+    SaveSettings,
+    ResetSettings,
+    Tick,
+    Ignore,
 }
 
-#[derive(Clone)]
 // Program struct, which stores the current information the program may need
-// fields:
-// 1. octave           -> The current octave the program is using
-// 2. bpm              -> The current beats per minute the program is using
-// 3. custom_bpm       -> String representation of the bpm, required for iced
-// 4. play_chords      -> Whether or not the play triad button is selected
-// 5. play_async       -> Whether or not to play notes asynchronously 
-// 6. is_recording     -> Whether or not the program is currently recording
-// 7. selected_scale   -> The scale that the program is currently using
-// 8. time_elapsed     -> The time elapsed since recording started
-// 9. note_length      -> The length of the note
-// 10. volume          -> The volume of the note
-// 11. buttons_pressed -> The buttons that are currently pressed
-struct Program { 
+struct Program {
     octave: f32,
     bpm: f32,
     custom_bpm: String,
     play_chords: bool,
-    play_async: bool,
-    is_recording: bool,
-    selected_scale: Option<Note>,  
-    time_elapsed: f32,
+    hold_mode: bool,
+    selected_scale: Option<Note>,
+    scale_type: ScaleType,
     note_length: f32,
     volume: f32,
     buttons_pressed: HashMap<Note, bool>,
-    sound_channel: Arc<Mutex<(std::sync::mpsc::Sender<SoundRequest>, std::sync::mpsc::Receiver<SoundRequest>)>>,
-    current_menu: CurrentMenu
+    key_glow: HashMap<Note, f32>,
+    clock: f32,
+    current_menu: CurrentMenu,
+    settings: Settings,
+    settings_saved: bool,
+    recording: Recording,
+    active: HashMap<Note, ActiveNote>,
+    file_name: String,
+    last_saved: Option<String>,
 }
 
-// implement the Program struct
-// functions: 
-// 1. update_bpm      -> check and update the bpm
-// 2. view            -> display gui
-// 3. update          -> update Program
-// 4. subscription    -> sets the iced subscription
-// 5. start_recording -> begin recording midi file
-// 6. stop_recording  -> stop recording midi
-// 7. get_note_length -> get the NoteLength from a float
-// 8. match_keyboard_key -> match the keyboard key to a Note
-impl Program { 
-    pub fn get_note_length(length: f32) -> NoteLength { 
-        return match length {
+impl Program {
+    pub fn get_note_length(length: f32) -> NoteLength {
+        match length {
             5.0 => NoteLength::Whole,
             4.0 => NoteLength::Half,
             3.0 => NoteLength::Quarter,
             2.0 => NoteLength::Eighth,
             1.0 => NoteLength::Sixteenth,
-            _ =>  NoteLength::Whole
-        }; 
+            _ => NoteLength::Whole,
+        }
     }
 
-    pub fn start_recording(&mut self) {
-        self.is_recording = true;
-        *RECORDING_START_TIME.lock().unwrap() = Some(std::time::Instant::now());
-        RECORDED_NOTES.lock().unwrap().clear();  
+    pub fn is_recording(&self) -> bool {
+        self.recording.is_active()
     }
-    
-    pub fn stop_recording(&mut self) -> Song {
-        self.is_recording = false;
-        let recorded_notes = RECORDED_NOTES.lock().unwrap().clone();
-    
-        let mut song = Song {
-            notes: vec![],
-            bpm: self.bpm,
-        };
-    
-        for (note, data) in recorded_notes {
-            for (octave, start_time, duration) in data {
-                song.notes.push((note.clone(), octave, start_time, duration));
-            }
-        }
-        song
-    }
-    
+
     pub fn update_bpm(&mut self, value: f32) {
         if NoteLength::check_bpm(value) {
             self.bpm = value;
-            self.custom_bpm = value.to_string();
+            self.custom_bpm = (value.round() as i32).to_string();
         } else {
             self.bpm = 60.0;
             self.custom_bpm = "60".to_string();
         }
     }
 
-    fn view(&self) -> Element<Message> {
-        Self::get_ui_information(self, Arc::new(Mutex::new(self.buttons_pressed.clone()))).into()
+    fn view(&self) -> Element<'_, Message> {
+        self.get_ui_information()
     }
 
     fn match_keyboard_key(key: keyboard::Key) -> Option<Note> {
         match key {
-            keyboard::Key::Character(c) => {
-                return match c.as_str() {
-                    "a" => Some(Note::C),
-                    "w" => Some(Note::Csharp),
-                    "s" => Some(Note::D),
-                    "r" => Some(Note::Dsharp),
-                    "d" => Some(Note::E),
-                    "f" => Some(Note::F),
-                    "t" => Some(Note::Fsharp),
-                    "g" => Some(Note::G),
-                    "y" => Some(Note::Gsharp),
-                    "h" => Some(Note::A),
-                    "j" => Some(Note::B),
-                    "u" => Some(Note::Asharp),
-                    _ => None
-                };
+            keyboard::Key::Character(c) => match c.as_str() {
+                "a" => Some(Note::C),
+                "w" => Some(Note::Csharp),
+                "s" => Some(Note::D),
+                "r" => Some(Note::Dsharp),
+                "d" => Some(Note::E),
+                "f" => Some(Note::F),
+                "t" => Some(Note::Fsharp),
+                "g" => Some(Note::G),
+                "y" => Some(Note::Gsharp),
+                "h" => Some(Note::A),
+                "u" => Some(Note::Asharp),
+                "j" => Some(Note::B),
+                _ => None,
             },
-            _ => {None}
+            _ => None,
         }
     }
-    
-    fn update(&mut self, message: Message) { 
-        match message { 
-            Message::ToggleHelpGUI => {
-                if self.current_menu == CurrentMenu::Help { 
-                    self.current_menu = CurrentMenu::Standard
-                } else {
-                    self.current_menu = CurrentMenu::Help
-                }
+
+    // The notes that actually sound when `note` is pressed (a single note, or a
+    // triad when chord mode is on).
+    fn sounding_notes(&self, note: Note) -> Vec<Note> {
+        if self.play_chords {
+            let real = RealNote { note, length: NoteLength::Quarter, octave: self.octave };
+            Chord::triad_from_note(&real, self.scale_type)
+                .notes
+                .iter()
+                .map(|n| n.note)
+                .collect()
+        } else {
+            vec![note]
+        }
+    }
+
+    fn press(&mut self, note: Note) {
+        if note == Note::None {
+            return;
+        }
+
+        self.buttons_pressed.insert(note, true);
+        self.key_glow.insert(note, 1.0);
+
+        let real_note = RealNote {
+            note,
+            length: Self::get_note_length(self.note_length),
+            octave: self.octave,
+        };
+        let tone = self.settings.tone();
+
+        if self.hold_mode {
+            // Avoid retriggering a note that is already sounding.
+            if self.active.contains_key(&note) {
+                return;
             }
 
-            Message::NoteLengthChange(value) => {
-                self.note_length = value;
+            let gates = if self.play_chords {
+                Chord::triad_from_note(&real_note, self.scale_type).play_held(self.volume, tone)
+            } else {
+                real_note.play_held(self.volume, tone)
+            };
+
+            let recorded = self.sounding_notes(note);
+            for &n in &recorded {
+                self.recording.note_on(n, self.octave);
             }
 
-            Message::VolumeChange(value) => {
-                self.volume = value;
+            self.active.insert(note, ActiveNote { gates, recorded });
+        } else {
+            let duration = Self::get_note_length(self.note_length)
+                .duration_in_seconds(self.bpm);
+
+            if self.play_chords {
+                Chord::triad_from_note(&real_note, self.scale_type)
+                    .play_fixed(self.bpm, self.volume, tone);
+            } else {
+                real_note.play_fixed(self.bpm, self.volume, tone);
             }
+
+            for n in self.sounding_notes(note) {
+                self.recording.note_fixed(n, self.octave, duration);
+            }
+        }
+    }
+
+    fn release(&mut self, note: Note) {
+        self.buttons_pressed.insert(note, false);
+
+        if let Some(active) = self.active.remove(&note) {
+            for gate in active.gates {
+                gate.store(false, Ordering::Relaxed);
+            }
+            for n in active.recorded {
+                self.recording.note_off(n);
+            }
+        }
+    }
+
+    fn update(&mut self, message: Message) {
+        match message {
+            Message::Ignore => {}
+
+            Message::SwitchMenu(menu) => {
+                self.current_menu = menu;
+            }
+
+            Message::NoteLengthChange(value) => self.note_length = value,
+            Message::VolumeChange(value) => self.volume = value,
 
             Message::Tick => {
-                if self.is_recording {
-                    let now = std::time::Instant::now();
-                    self.time_elapsed = now.duration_since(*RECORDING_START_TIME.lock().unwrap().as_ref().unwrap()).as_secs_f32();
-                } else {
-                    self.time_elapsed = 0.0;
+                let dt = TICK.as_secs_f32();
+                self.clock += dt;
+                for note in Note::NOTES {
+                    let held = self.buttons_pressed.get(&note).copied().unwrap_or(false);
+                    let glow = self.key_glow.entry(note).or_insert(0.0);
+                    if held {
+                        *glow = 1.0;
+                    } else if *glow > 0.0 {
+                        *glow = (*glow - dt / GLOW_FADE).max(0.0);
+                    }
                 }
-
-                // if let Ok(sound_request) = self.sound_channel.lock().unwrap().1.try_recv() {
-                //     let real_note = sound_request.real_note;
-                //     let time = NoteLength::duration_in_seconds(&real_note.length, sound_request.bpm);
-                //     let frequency = RealNote::base_frequencies(real_note.note.clone()) * 2_f32.powf(self.octave);
-                //     let source = rodio::source::SineWave::new(frequency)
-                //         .amplify(0.1)
-                //         .take_duration(Duration::from_secs_f32(time));
-                //     let (_stream, handle) = OutputStream::try_default().expect("Failed to create output stream");
-                //     let sink = Sink::try_new(&handle).expect("Failed to create sink");
-
-                //     sink.append(source);
-                //     sink.play(); 
-                //     sink.set_volume(sound_request.volume / 10.0);
-                //     sink.sleep_until_end();                    
-                // }
             }
 
             Message::Scale(note) => {
-                self.selected_scale = Some(note); 
+                self.selected_scale = if note == Note::None { None } else { Some(note) };
             }
+
+            Message::ScaleTypeChange(scale_type) => self.scale_type = scale_type,
 
             Message::KeyPressed(key) => {
-                let note = Self::match_keyboard_key(key);
-
-                if let Some(note) = note {
-                    self.buttons_pressed.insert(note, true); 
-                    self.update(Message::Play(note, false));
+                // Octave shortcuts: ] raises the octave, [ lowers it.
+                if let keyboard::Key::Character(c) = &key {
+                    match c.as_str() {
+                        "]" => {
+                            self.octave = (self.octave + 1.0).min(6.0);
+                            return;
+                        }
+                        "[" => {
+                            self.octave = (self.octave - 1.0).max(0.0);
+                            return;
+                        }
+                        _ => {}
+                    }
                 }
-            },
+
+                if let Some(note) = Self::match_keyboard_key(key)
+                    && !self.buttons_pressed.get(&note).copied().unwrap_or(false)
+                {
+                    self.press(note);
+                }
+            }
 
             Message::KeyReleased(key) => {
-                let note = Self::match_keyboard_key(key);
-                
-                if let Some(note) = note {
-                    self.buttons_pressed.insert(note, false); 
+                if let Some(note) = Self::match_keyboard_key(key) {
+                    self.release(note);
                 }
-            },
+            }
 
-            Message::ToggleRecoring => {
-                if self.is_recording == false{
-                    self.start_recording();
-                } else { 
-                    let song = self.stop_recording();
-                    midi::Midi::midi_file_create(song);
+            Message::ToggleRecording => {
+                if !self.recording.is_active() {
+                    self.recording.begin();
+                } else {
+                    let song = self.recording.finish(self.bpm);
+                    match midi::Midi::midi_file_create(
+                        song,
+                        &self.settings.output_dir,
+                        &self.file_name,
+                    ) {
+                        Some(path) => self.last_saved = Some(path.display().to_string()),
+                        None => self.last_saved = Some("Failed to save MIDI file".to_string()),
+                    }
                 }
-            },
-
-           
-            Message::PlayChords => {
-                self.play_chords = !self.play_chords;
             }
 
-            Message::PlayAsync => {
-                self.play_async = !self.play_async;
+            Message::FileNameChange(value) => self.file_name = value,
+
+            Message::OutputDirChange(value) => {
+                self.settings.output_dir = value;
+                self.settings_saved = false;
             }
 
-            Message::OctaveChange(value) => {
-                self.octave = value;
+            Message::ToggleChords => self.play_chords = !self.play_chords,
+
+            Message::ToggleHold => {
+                self.hold_mode = !self.hold_mode;
+                // Release anything currently held so notes don't get stuck.
+                let active: Vec<Note> = self.active.keys().copied().collect();
+                for note in active {
+                    self.release(note);
+                }
             }
+
+            Message::OctaveChange(value) => self.octave = value,
 
             Message::CustomBpmChange(value) => {
-                if let Ok(value) = value.parse::<f32>() {
-                    Self::update_bpm(self, value);
-                } 
-            }
-
-            Message::BpmChange(value) => {
-                Self::update_bpm(self, value);
-            }
-
-            Message::EndPlaying(note) => {
-                self.buttons_pressed.insert(note, false); // Update pressed state
-            }
-
-            Message::Play(note, _gui) => {
-                self.buttons_pressed.insert(note, true); // Update pressed state
-
-                if note == Note::None {
-                    return;
+                if value.is_empty() {
+                    self.custom_bpm = value;
+                } else if let Ok(parsed) = value.parse::<f32>() {
+                    self.update_bpm(parsed);
                 }
+            }
 
-                let note_length: NoteLength = match self.note_length {
-                    5.0 => NoteLength::Whole,
-                    4.0 => NoteLength::Half,
-                    3.0 => NoteLength::Quarter,
-                    2.0 => NoteLength::Eighth,
-                    1.0 => NoteLength::Sixteenth,
-                    _ =>  NoteLength::Whole
-                };
+            Message::BpmChange(value) => self.update_bpm(value),
 
-                let real_note = RealNote {
-                    note: note,
-                    length: note_length, 
-                    octave: self.octave,
-                };
+            Message::EndPlaying(note) => self.release(note),
 
-                if self.play_chords == false && self.play_async == false {  
-                    real_note.play(self.bpm, self.is_recording, self.volume);
-                } else if self.play_chords == true { 
-                    let chord = Chord::triad_from_note(&real_note);
-                    chord.play(self.bpm, self.is_recording, self.volume);
-                } else if self.play_async == true {               
-                    real_note.play_async(self.bpm, self.is_recording, self.volume);
+            Message::Play(note) => self.press(note),
+
+            Message::SetInfoPopup(value) => {
+                self.settings.info_popup = value;
+                self.settings_saved = false;
+            }
+            Message::SetDefaultHold(value) => {
+                self.settings.default_hold_mode = value;
+                self.settings_saved = false;
+            }
+            Message::AttackChange(value) => {
+                self.settings.attack_ms = value as u32;
+                self.settings_saved = false;
+            }
+            Message::ReleaseChange(value) => {
+                self.settings.release_ms = value as u32;
+                self.settings_saved = false;
+            }
+            Message::GainChange(value) => {
+                self.settings.master_gain = value;
+                self.settings_saved = false;
+            }
+            Message::SaveSettings => {
+                match self.settings.save() {
+                    Ok(()) => self.settings_saved = true,
+                    Err(e) => eprintln!("Failed to save settings: {e}"),
                 }
+            }
+            Message::ResetSettings => {
+                self.settings = Settings::default();
+                self.settings_saved = false;
             }
         }
     }
 
-    
     fn subscription(&self) -> Subscription<Message> {
-        struct Timer;
-        impl<H: std::hash::Hasher, E> Recipe<H, E> for Timer {            
-            type Output = Message;
-            fn hash(&self, state: &mut H) {
-                use std::hash::Hash;
-                "timer".hash(state);
+        let keyboard = keyboard::listen().map(|event| match event {
+            keyboard::Event::KeyPressed { key, repeat, .. } => {
+                if repeat {
+                    Message::Ignore
+                } else {
+                    Message::KeyPressed(key)
+                }
             }
+            keyboard::Event::KeyReleased { key, .. } => Message::KeyReleased(key),
+            _ => Message::Ignore,
+        });
 
-            fn stream(self: Box<Self>, _: futures::stream::BoxStream<'static, E>) -> futures::stream::BoxStream<'static, Self::Output> {
-                futures::stream::unfold((), |_| async {
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    Some((Message::Tick, ()))
-                }).boxed()
-            }
-        }
+        let timer = time::every(TICK).map(|_| Message::Tick);
 
-        impl Stream for Timer {
-            type Item = Message;
-
-            fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-                cx.waker().wake_by_ref();
-                Poll::Ready(Some(Message::Tick))
-            }
-        }
-        
-        Subscription::batch(vec![
-            keyboard::on_key_press(|key, _modifiers| Some(Message::KeyPressed(key))),
-            keyboard::on_key_release(|key, _modifiers| Some(Message::KeyReleased(key))),
-            Subscription::run_with_id("timer", Timer)
-        ])
+        Subscription::batch(vec![keyboard, timer])
     }
 }
 
 // changing Default for Program
-impl Default for Program { 
+impl Default for Program {
     fn default() -> Self {
+        let settings = Settings::load();
+
         let mut buttons_pressed = HashMap::new();
-        for note in [
-            Note::C, Note::Csharp, Note::D, Note::Dsharp, 
-            Note::E, Note::F, Note::Fsharp, Note::G, 
-            Note::Gsharp, Note::A, Note::Asharp, Note::B
-        ].iter() {
-            buttons_pressed.insert(*note, false);
+        let mut key_glow = HashMap::new();
+        for note in Note::NOTES {
+            buttons_pressed.insert(note, false);
+            key_glow.insert(note, 0.0);
         }
 
-        // Reading settings.json
-        let settings = match fs::read_to_string("./config/settings.json") {
-            Ok(dp) => dp, 
-            Err(_e) => {
-                println!("An error occured reading settings"); 
-                "[]".to_string()
-            }
-        };
-        let settings_hmap: HashMap<String, bool> = match serde_json::from_str(&settings) {
-            Ok(sp) => sp, 
-            Err(_e) => {
-                println!("An error occured reading settings (bad format)"); 
-                HashMap::from([
-                    ("info_popup".to_string(), false)
-                ])
-            }
-        };
-
-        let current_menu = if *settings_hmap.get("info_popup").unwrap_or(&false) {
+        let current_menu = if settings.info_popup {
             CurrentMenu::Help
         } else {
             CurrentMenu::Standard
         };
 
         Self {
-            note_length: 2.0, 
-            selected_scale: None,  
+            note_length: 2.0,
+            selected_scale: None,
+            scale_type: ScaleType::Major,
             octave: 4.0,
             bpm: 120.0,
             custom_bpm: "120".to_string(),
             play_chords: false,
-            play_async: true,
-            is_recording: false,
-            time_elapsed: 0.0,
+            hold_mode: settings.default_hold_mode,
             volume: 30.0,
-            buttons_pressed: buttons_pressed,
-            sound_channel: Arc::new(Mutex::new(
-                std::sync::mpsc::channel::<SoundRequest>()
-            )),
-            current_menu: current_menu
+            buttons_pressed,
+            key_glow,
+            clock: 0.0,
+            current_menu,
+            settings,
+            settings_saved: true,
+            recording: Recording::default(),
+            active: HashMap::new(),
+            file_name: "recording".to_string(),
+            last_saved: None,
         }
     }
 }
 
+fn theme(_state: &Program) -> Theme {
+    Theme::TokyoNight
+}
+
+fn load_icon() -> Option<iced::window::Icon> {
+    let mut icon_bytes = Vec::new();
+    File::open("./assets/icon.ico")
+        .ok()?
+        .read_to_end(&mut icon_bytes)
+        .ok()?;
+
+    let image = image::load_from_memory(&icon_bytes).ok()?.into_rgba8();
+    let (width, height) = image.dimensions();
+    iced::window::icon::from_rgba(image.into_raw(), width, height).ok()
+}
 
 // main function
 pub fn main() -> iced::Result {
-    let mut icon_bytes = Vec::new();
-    let mut file = match File::open("./assets/icon.ico") {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("Failed to open the icon file: {}", e);
-            return Ok(()); 
-        }
-    };
-
-    if let Err(e) = file.read_to_end(&mut icon_bytes) {
-        eprintln!("Failed to read the icon file: {}", e);
-        return Ok(()); 
-    }
-
-    let icon = match image::ImageReader::open("./assets/icon.ico") {
-        Ok(image_reader) => {
-            match image_reader.decode() {
-                Ok(img) => {
-                    let rgba_image = img.into_rgba8();
-                    let (width, height) = rgba_image.dimensions();
-                    
-                    match iced::window::icon::from_rgba(rgba_image.into_raw(), width, height) {
-                        Ok(icon) => Some(icon),
-                        Err(e) => {
-                            eprintln!("Failed to create icon: {}", e);
-                            None
-                        }
-                    }
-                },
-                Err(e) => {
-                    eprintln!("Failed to decode the image: {}", e);
-                    None
-                }
-            }
-        },
-        Err(e) => {
-            eprintln!("Failed to open the icon file: {}", e);
-            None
-        }
-    };
-
     let window_settings = iced::window::Settings {
-        icon,
+        icon: load_icon(),
+        // Generous minimum so the keyboard always fits, but small enough for
+        // modest laptop displays; the content scrolls if the window is shorter.
+        min_size: Some(Size::new(520.0, 460.0)),
         ..iced::window::Settings::default()
     };
 
-
-    iced::application("Rust Music Keyboard", Program::update, Program::view)
-        .window_size(Size::new(700.0, 720.0))
+    iced::application(Program::default, Program::update, Program::view)
+        .title("Rust Music Keyboard Renewed")
+        .window_size(Size::new(720.0, 760.0))
         .subscription(Program::subscription)
-        .theme(|_| Theme::TokyoNight)
-    .window(window_settings)
+        .theme(theme)
+        .window(window_settings)
         .run()
 }

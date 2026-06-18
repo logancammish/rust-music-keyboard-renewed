@@ -1,20 +1,23 @@
 [Setup]
-AppName=KeyboardAppLCammish
-AppVersion=0.3.0
-DefaultDirName={pf}\KeyboardAppLCammish
-DefaultGroupName=KeyboardAppLCammish
+AppName=Rust Music Keyboard Renewed
+AppVersion=0.4.0
+AppPublisher=Logan Cammish
+DefaultDirName={pf}\RustMusicKeyboardRenewed
+DefaultGroupName=Rust Music Keyboard Renewed
 OutputDir=.
-OutputBaseFilename=KeyboardAppLCammish_Installer-Windows-x86_64
+OutputBaseFilename=RustMusicKeyboardRenewed_Installer-Windows-x86_64
 Compression=lzma
 SolidCompression=yes
 
+; Paths are relative to this script, so the installer builds on any machine.
 [Files]
-Source: "C:\Users\L.J.Cammish\OneDrive - Saint Kentigern\Documents\rust-music-keyboard\target\release\KeyboardAppLCammish.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "C:\Users\L.J.Cammish\OneDrive - Saint Kentigern\Documents\rust-music-keyboard\assets\*"; DestDir: "{app}\assets"; Flags: recursesubdirs createallsubdirs
+Source: "target\release\RustMusicKeyboardRenewed.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "assets\*"; DestDir: "{app}\assets"; Flags: recursesubdirs createallsubdirs
+Source: "config\*"; DestDir: "{app}\config"; Flags: recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\KeyboardAppLCammish"; Filename: "{app}\KeyboardAppLCammish.exe"
-Name: "{commondesktop}\KeyboardAppLCammish"; Filename: "{app}\KeyboardAppLCammish.exe"
+Name: "{group}\Rust Music Keyboard Renewed"; Filename: "{app}\RustMusicKeyboardRenewed.exe"
+Name: "{commondesktop}\Rust Music Keyboard Renewed"; Filename: "{app}\RustMusicKeyboardRenewed.exe"
 
 [Run]
-Filename: "{app}\KeyboardAppLCammish.exe"; Description: "Launch KeyboardAppLCammish"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\RustMusicKeyboardRenewed.exe"; Description: "Launch Rust Music Keyboard Renewed"; Flags: nowait postinstall skipifsilent
