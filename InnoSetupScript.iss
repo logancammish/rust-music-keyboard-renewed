@@ -1,6 +1,6 @@
 [Setup]
 AppName=Rust Music Keyboard Renewed
-AppVersion=0.4.0
+AppVersion=0.4.1
 AppPublisher=Logan Cammish
 DefaultDirName={pf}\RustMusicKeyboardRenewed
 DefaultGroupName=Rust Music Keyboard Renewed

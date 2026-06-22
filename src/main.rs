@@ -11,7 +11,10 @@ use note::*;
 use settings::Settings;
 
 // use dependencies
-use iced::{keyboard, time, Element, Size, Subscription, Theme};
+use iced::{
+    event::{self, Event},
+    keyboard, time, Element, Size, Subscription, Theme,
+};
 use once_cell::sync::Lazy;
 use rodio::mixer::Mixer;
 use rodio::stream::DeviceSinkBuilder;
@@ -152,11 +155,13 @@ enum Message {
     ToggleRecording,
     NoteLengthChange(f32),
     VolumeChange(f32),
+    WaveformChange(Waveform),
     FileNameChange(String),
     SwitchMenu(CurrentMenu),
     // Advanced settings
     SetInfoPopup(bool),
     SetDefaultHold(bool),
+    SetVisualizer(VisualizerStyle),
     AttackChange(f32),
     ReleaseChange(f32),
     GainChange(f32),
@@ -164,7 +169,6 @@ enum Message {
     SaveSettings,
     ResetSettings,
     Tick,
-    Ignore,
 }
 
 // Program struct, which stores the current information the program may need
@@ -321,14 +325,17 @@ impl Program {
 
     fn update(&mut self, message: Message) {
         match message {
-            Message::Ignore => {}
-
             Message::SwitchMenu(menu) => {
                 self.current_menu = menu;
             }
 
             Message::NoteLengthChange(value) => self.note_length = value,
             Message::VolumeChange(value) => self.volume = value,
+
+            Message::WaveformChange(waveform) => {
+                self.settings.waveform = waveform;
+                self.settings_saved = false;
+            }
 
             Message::Tick => {
                 let dt = TICK.as_secs_f32();
@@ -416,11 +423,16 @@ impl Program {
             Message::OctaveChange(value) => self.octave = value,
 
             Message::CustomBpmChange(value) => {
-                if value.is_empty() {
-                    self.custom_bpm = value;
-                } else if let Ok(parsed) = value.parse::<f32>() {
-                    self.update_bpm(parsed);
+                // Always reflect exactly what the user typed so the field never
+                // fights the cursor; only adopt the value as the tempo once it
+                // parses and lands in range (so a partial "3" on the way to
+                // "300" doesn't snap the BPM around).
+                if let Ok(parsed) = value.parse::<f32>()
+                    && NoteLength::check_bpm(parsed)
+                {
+                    self.bpm = parsed;
                 }
+                self.custom_bpm = value;
             }
 
             Message::BpmChange(value) => self.update_bpm(value),
@@ -435,6 +447,10 @@ impl Program {
             }
             Message::SetDefaultHold(value) => {
                 self.settings.default_hold_mode = value;
+                self.settings_saved = false;
+            }
+            Message::SetVisualizer(style) => {
+                self.settings.visualizer = style;
                 self.settings_saved = false;
             }
             Message::AttackChange(value) => {
@@ -463,16 +479,23 @@ impl Program {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let keyboard = keyboard::listen().map(|event| match event {
-            keyboard::Event::KeyPressed { key, repeat, .. } => {
-                if repeat {
-                    Message::Ignore
+        // `listen_with` exposes the event status, which lets us ignore key
+        // presses that a focused widget already handled. That stops the
+        // computer-keyboard note mapping from firing notes while the user is
+        // typing in the filename / BPM / save-folder fields. Releases are
+        // always handled so a held note can never get stuck.
+        let keyboard = event::listen_with(|event, status, _window| match event {
+            Event::Keyboard(keyboard::Event::KeyPressed { key, repeat, .. }) => {
+                if repeat || status == event::Status::Captured {
+                    None
                 } else {
-                    Message::KeyPressed(key)
+                    Some(Message::KeyPressed(key))
                 }
             }
-            keyboard::Event::KeyReleased { key, .. } => Message::KeyReleased(key),
-            _ => Message::Ignore,
+            Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) => {
+                Some(Message::KeyReleased(key))
+            }
+            _ => None,
         });
 
         let timer = time::every(TICK).map(|_| Message::Tick);

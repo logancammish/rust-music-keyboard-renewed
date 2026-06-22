@@ -4,5 +4,7 @@
   "attack_ms": 12,
   "release_ms": 160,
   "master_gain": 0.18,
+  "waveform": "Square",
+  "visualizer": "Bars",
   "output_dir": ""
 }

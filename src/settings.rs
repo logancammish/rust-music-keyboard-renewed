@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
-use crate::ToneSettings;
+use crate::{ToneSettings, VisualizerStyle, Waveform};
 
 const SETTINGS_PATH: &str = "./config/settings.json";
 
@@ -23,6 +23,10 @@ pub struct Settings {
     // Master output gain (per-voice amplitude). Lower values leave more
     // headroom before the mixed output clips.
     pub master_gain: f32,
+    // The oscillator shape used for every voice (the "sound" of the keyboard).
+    pub waveform: Waveform,
+    // Which animated visualiser to draw (or `Off` to disable it).
+    pub visualizer: VisualizerStyle,
     // Directory that recorded MIDI files are written to. Leave blank to use the
     // platform default (Documents/RustMusicKeyboardRenewed on Windows).
     pub output_dir: String,
@@ -36,6 +40,8 @@ impl Default for Settings {
             attack_ms: 12,
             release_ms: 160,
             master_gain: 0.18,
+            waveform: Waveform::default(),
+            visualizer: VisualizerStyle::default(),
             output_dir: String::new(),
         }
     }
@@ -72,6 +78,7 @@ impl Settings {
             attack_ms: self.attack_ms.max(1),
             release_ms: self.release_ms.max(1),
             gain: self.master_gain.clamp(0.02, 0.5),
+            waveform: self.waveform,
         }
     }
 }

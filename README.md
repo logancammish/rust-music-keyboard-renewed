@@ -18,6 +18,8 @@ A polished, playable polyphonic synth keyboard built in Rust with [`iced`](https
 | Feature | |
 |---|:---:|
 | Polyphonic synth voice (harmonics + attack/release envelope) | ✔️ |
+| **Selectable sound** — Sine, Triangle, Organ, Sawtooth or Square waveform | ✔️ |
+| **Live visualisers** — pick a Waveform line or full Bars display, or switch it Off | ✔️ |
 | **Hold-to-play** — note length follows how long you hold a key | ✔️ |
 | Fixed note lengths (Whole → Sixteenth) with adjustable BPM | ✔️ |
 | Play every note in Western music, by mouse or computer keyboard | ✔️ |
@@ -80,11 +82,13 @@ Default save folder:
 | `attack_ms` | Envelope attack time (note fade-in) |
 | `release_ms` | Envelope release time (note fade-out) |
 | `master_gain` | Per-voice output gain (lower = more headroom before clipping) |
+| `waveform` | Oscillator shape: `Sine`, `Triangle`, `Organ`, `Sawtooth` or `Square` |
+| `visualizer` | Visualiser style: `Off`, `Waveform` (line) or `Bars` (full) |
 | `output_dir` | Save folder for recordings (blank = platform default) |
 
 ## Versioning
 
-Format: `MAJOR.MINOR.PATCH`. Current version: **0.4.0**.
+Format: `MAJOR.MINOR.PATCH`. Current version: **0.4.1**.
 
 ## License
 

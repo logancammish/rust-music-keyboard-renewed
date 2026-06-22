@@ -2,13 +2,18 @@ use iced::{
     alignment,
     border::Radius,
     font::Weight,
+    mouse,
     widget::{
-        self, button, checkbox, column, container, pick_list, row, scrollable, slider, text,
-        text_input, toggler, MouseArea, Space,
+        self, button,
+        canvas::{self, Canvas, Frame, Geometry, Path, Stroke},
+        checkbox, column, container, pick_list, row, scrollable, slider, text, text_input,
+        toggler, MouseArea, Space,
     },
-    Background, Border, Color, Element, Font, Length, Shadow, Theme, Vector,
+    Background, Border, Color, Element, Font, Length, Point, Rectangle, Renderer, Shadow, Size,
+    Theme, Vector,
 };
-use crate::{Chord, Message, Note, Program, ScaleType};
+use crate::{Chord, Message, Note, Program, ScaleType, Waveform};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +21,43 @@ pub enum CurrentMenu {
     Standard,
     Advanced,
     Help,
+}
+
+// Which on-screen visualiser to draw (or none). This is the single switch the
+// user changes in Advanced Settings; both the Play-tab preview and the recording
+// panel render in the chosen style.
+//
+// To plug in a different "fully-fledged" visualiser, add a variant here and a
+// matching arm in `Visualizer::draw` (in this file). Everything else — the
+// settings persistence, the picker, and the two render sites — already routes
+// through this enum, so no other code needs to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum VisualizerStyle {
+    // No visualiser at all.
+    Off,
+    // A single animated oscilloscope line of the current waveform.
+    #[default]
+    Waveform,
+    // A fuller, spectrum-style bank of animated bars.
+    Bars,
+}
+
+impl VisualizerStyle {
+    pub const ALL: [VisualizerStyle; 3] = [
+        VisualizerStyle::Off,
+        VisualizerStyle::Waveform,
+        VisualizerStyle::Bars,
+    ];
+}
+
+impl fmt::Display for VisualizerStyle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            VisualizerStyle::Off => "Off",
+            VisualizerStyle::Waveform => "Waveform (line)",
+            VisualizerStyle::Bars => "Bars (full)",
+        })
+    }
 }
 
 // Tokyo Night accent colours.
@@ -164,8 +206,8 @@ impl Program {
         .spacing(6);
 
         column![
-            text("Rust Music Keyboard Renewed").size(26).font(bold()),
-            text("A playable polyphonic synth keyboard")
+            text("♪  Rust Music Keyboard Renewed").size(26).font(bold()),
+            text("A playable polyphonic synth keyboard — pick a sound, choose a scale, play and record.")
                 .size(13)
                 .color(MUTED),
             Space::new().height(Length::Fixed(8.0)),
@@ -183,34 +225,107 @@ impl Program {
             .into()
     }
 
+    // A small uppercase heading used to break the control panel into sections.
+    fn section(title: &str) -> Element<'_, Message> {
+        text(title.to_uppercase())
+            .size(12)
+            .font(bold())
+            .color(ACCENT)
+            .into()
+    }
+
+    // How "loud" the keyboard looks right now (0..=1), taken from the brightest
+    // key glow. Glows fade out smoothly after release, so this gives the
+    // visualisers a natural attack/decay without tapping the audio thread.
+    fn visual_energy(&self) -> f32 {
+        self.key_glow
+            .values()
+            .copied()
+            .fold(0.0_f32, f32::max)
+            .clamp(0.0, 1.0)
+    }
+
+    // An animated visualiser of the current sound, in the user's chosen style.
+    // Returns `None` when the visualiser is switched off, so call sites can
+    // simply skip pushing it.
+    fn visualizer(
+        &self,
+        color: Color,
+        speed: f32,
+        cycles: f32,
+        height: f32,
+    ) -> Option<Element<'_, Message>> {
+        let style = self.settings.visualizer;
+        if style == VisualizerStyle::Off {
+            return None;
+        }
+        let viz = Visualizer {
+            style,
+            waveform: self.settings.waveform,
+            energy: self.visual_energy(),
+            clock: self.clock,
+            speed,
+            cycles,
+            color,
+        };
+        Some(
+            container(
+                Canvas::new(viz)
+                    .width(Length::Fill)
+                    .height(Length::Fixed(height)),
+            )
+            .width(Length::Fill)
+            .into(),
+        )
+    }
+
     fn controls(&self) -> Element<'_, Message> {
-        let mut rows = column![].spacing(14);
+        // --- Sound: the timbre and loudness of the keyboard. ---
+        let waveform_row = row![
+            Self::label("Sound"),
+            pick_list(
+                Waveform::ALL.to_vec(),
+                Some(self.settings.waveform),
+                Message::WaveformChange,
+            )
+            .width(Length::Fixed(140.0)),
+            text("the instrument voice each key plays")
+                .size(13)
+                .color(MUTED),
+        ]
+        .spacing(12)
+        .align_y(alignment::Vertical::Center);
 
-        // Hold-to-play toggle. When on, the note-length control is irrelevant
-        // (length follows how long you hold the key) so it is hidden.
-        rows = rows.push(
-            toggler(self.hold_mode)
-                .label("Hold to play  (note length follows your press)")
-                .on_toggle(|_| Message::ToggleHold)
-                .spacing(12)
-                .size(22),
-        );
+        let volume_row = row![
+            Self::label("Volume"),
+            slider(0.0..=100.0, self.volume, Message::VolumeChange),
+            text(format!("{}%", self.volume.round() as i32)).width(Length::Fixed(60.0)),
+        ]
+        .spacing(12)
+        .align_y(alignment::Vertical::Center);
 
+        // --- Timing: how long notes last and the tempo for fixed notes. ---
+        let hold_toggle = toggler(self.hold_mode)
+            .label("Hold to play  (note length follows your press)")
+            .on_toggle(|_| Message::ToggleHold)
+            .spacing(12)
+            .size(22);
+
+        let mut timing = column![hold_toggle].spacing(14);
+        // The note-length control is irrelevant in hold mode (length follows the
+        // press) so it is hidden there.
         if !self.hold_mode {
-            rows = rows.push(
+            timing = timing.push(
                 row![
                     Self::label("Note length"),
-                    slider(1.0..=5.0, self.note_length, Message::NoteLengthChange),
+                    slider(1.0..=5.0, self.note_length, Message::NoteLengthChange).step(1.0),
                     text(format!("{}", Self::get_note_length(self.note_length)))
-                        .width(Length::Fixed(90.0)),
+                        .width(Length::Fixed(80.0)),
                 ]
                 .spacing(12)
                 .align_y(alignment::Vertical::Center),
             );
-        }
-
-        rows = rows
-            .push(
+            timing = timing.push(
                 row![
                     Self::label("BPM"),
                     slider(10.0..=300.0, self.bpm, Message::BpmChange),
@@ -221,58 +336,65 @@ impl Program {
                 ]
                 .spacing(12)
                 .align_y(alignment::Vertical::Center),
-            )
-            .push(
-                row![
-                    Self::label("Volume"),
-                    slider(0.0..=100.0, self.volume, Message::VolumeChange),
-                    text(format!("{}%", self.volume.round() as i32)).width(Length::Fixed(90.0)),
-                ]
-                .spacing(12)
-                .align_y(alignment::Vertical::Center),
-            )
-            .push(
-                row![
-                    Self::label("Octave"),
-                    button(text("−"))
-                        .style(button::secondary)
-                        .on_press(Message::OctaveChange((self.octave - 1.0).max(0.0))),
-                    text(format!("{}", self.octave as i32))
-                        .size(18)
-                        .width(Length::Fixed(34.0))
-                        .align_x(alignment::Horizontal::Center),
-                    button(text("+"))
-                        .style(button::secondary)
-                        .on_press(Message::OctaveChange((self.octave + 1.0).min(6.0))),
-                ]
-                .spacing(12)
-                .align_y(alignment::Vertical::Center),
             );
+        }
+
+        // --- Octave & Scale: pitch range and the highlighted key/mode. ---
+        let octave_row = row![
+            Self::label("Octave"),
+            button(text("−"))
+                .style(button::secondary)
+                .on_press(Message::OctaveChange((self.octave - 1.0).max(0.0))),
+            text(format!("{}", self.octave as i32))
+                .size(18)
+                .width(Length::Fixed(34.0))
+                .align_x(alignment::Horizontal::Center),
+            button(text("+"))
+                .style(button::secondary)
+                .on_press(Message::OctaveChange((self.octave + 1.0).min(6.0))),
+            text("or use the [ and ] keys").size(13).color(MUTED),
+        ]
+        .spacing(12)
+        .align_y(alignment::Vertical::Center);
 
         let scale_options: Vec<Note> = std::iter::once(Note::None).chain(Note::NOTES).collect();
-        rows = rows.push(
-            row![
-                Self::label("Scale"),
-                pick_list(
-                    scale_options,
-                    Some(self.selected_scale.unwrap_or(Note::None)),
-                    Message::Scale,
-                )
-                .width(Length::Fixed(130.0)),
-                pick_list(
-                    ScaleType::ALL.to_vec(),
-                    Some(self.scale_type),
-                    Message::ScaleTypeChange,
-                )
-                .width(Length::Fixed(110.0)),
-                checkbox(self.play_chords)
-                    .label("Play triads")
-                    .on_toggle(|_| Message::ToggleChords)
-                    .spacing(8),
-            ]
-            .spacing(12)
-            .align_y(alignment::Vertical::Center),
-        );
+        let scale_row = row![
+            Self::label("Scale"),
+            pick_list(
+                scale_options,
+                Some(self.selected_scale.unwrap_or(Note::None)),
+                Message::Scale,
+            )
+            .width(Length::Fixed(130.0)),
+            pick_list(
+                ScaleType::ALL.to_vec(),
+                Some(self.scale_type),
+                Message::ScaleTypeChange,
+            )
+            .width(Length::Fixed(110.0)),
+            checkbox(self.play_chords)
+                .label("Play triads")
+                .on_toggle(|_| Message::ToggleChords)
+                .spacing(8),
+        ]
+        .spacing(12)
+        .align_y(alignment::Vertical::Center);
+
+        let mut sound = column![Self::section("Sound"), waveform_row].spacing(14);
+        if let Some(viz) = self.visualizer(ACCENT, 0.6, 2.0, 64.0) {
+            sound = sound.push(viz);
+        }
+        sound = sound.push(volume_row);
+
+        let rows = column![
+            sound,
+            Self::section("Timing"),
+            timing,
+            Self::section("Octave & Scale"),
+            octave_row,
+            scale_row,
+        ]
+        .spacing(14);
 
         container(rows)
             .style(Self::card_style)
@@ -404,7 +526,16 @@ impl Program {
         .spacing(12)
         .align_y(alignment::Vertical::Center);
 
-        let mut content = column![top, name_row].spacing(12);
+        let mut content = column![top].spacing(12);
+
+        // Visualiser strip: lively red while recording, a calm muted trace
+        // otherwise, so you can see the keyboard is making sound as you capture.
+        let (viz_color, viz_speed) = if recording { (REC, 2.4) } else { (MUTED, 1.0) };
+        if let Some(viz) = self.visualizer(viz_color, viz_speed, 5.0, 70.0) {
+            content = content.push(viz);
+        }
+
+        content = content.push(name_row);
 
         if let Some(saved) = &self.last_saved {
             content = content.push(text(format!("Last saved: {saved}")).size(12).color(MUTED));
@@ -442,6 +573,20 @@ impl Program {
                 .on_toggle(Message::SetDefaultHold)
                 .spacing(12)
                 .size(22),
+            row![
+                Self::label("Visualiser"),
+                pick_list(
+                    VisualizerStyle::ALL.to_vec(),
+                    Some(s.visualizer),
+                    Message::SetVisualizer,
+                )
+                .width(Length::Fixed(170.0)),
+                text("shown on the Play tab and while recording (set Off to disable)")
+                    .size(13)
+                    .color(MUTED),
+            ]
+            .spacing(12)
+            .align_y(alignment::Vertical::Center),
         ]
         .spacing(12);
 
@@ -521,12 +666,13 @@ impl Program {
         let steps = column![
             text("Getting started").size(24).font(bold()),
             text(
-                "1.  Choose hold-to-play (length follows your press) or pick a fixed note length.\n\
-                 2.  Set the BPM for fixed-length notes.\n\
-                 3.  Play by clicking the keys or using your computer keyboard.\n\
-                 4.  Change octave with the on-screen buttons or the [ and ] keys.\n\
-                 5.  Pick a scale to highlight its notes, and toggle Major / Minor.\n\
-                 6.  Name your file and press Record to export it as a MIDI file."
+                "1.  Pick a Sound (Sine, Triangle, Organ, Sawtooth or Square) to set the keyboard's voice.\n\
+                 2.  Choose hold-to-play (length follows your press) or pick a fixed note length.\n\
+                 3.  Set the BPM for fixed-length notes.\n\
+                 4.  Play by clicking the keys or using your computer keyboard.\n\
+                 5.  Change octave with the on-screen buttons or the [ and ] keys.\n\
+                 6.  Pick a scale to highlight its notes, and toggle Major / Minor.\n\
+                 7.  Name your file and press Record to export it as a MIDI file."
             )
             .size(15),
         ]
@@ -602,4 +748,113 @@ impl Program {
 // A flexible spacer measured in the same proportional units as the piano keys.
 fn portion(units: u16) -> Space {
     Space::new().width(Length::FillPortion(units))
+}
+
+// An animated visualiser drawn on a canvas. It is rebuilt every UI tick from
+// `clock` (animation) and `energy` (how much is playing), so it moves smoothly
+// and swells while notes sound. The `style` selects how it is rendered.
+struct Visualizer {
+    style: VisualizerStyle,
+    waveform: Waveform,
+    energy: f32, // 0..=1, how lively the display is right now
+    clock: f32,  // monotonic UI clock, in seconds
+    speed: f32,  // animation speed multiplier
+    cycles: f32, // waveform cycles drawn across the width (Waveform style)
+    color: Color,
+}
+
+impl Visualizer {
+    // A scrolling oscilloscope line of the current waveform.
+    fn draw_waveform(&self, frame: &mut Frame) {
+        let (w, h) = (frame.width(), frame.height());
+        let mid = h / 2.0;
+
+        // Faint zero line so the trace has a baseline to sit against.
+        let baseline = Path::new(|b| {
+            b.move_to(Point::new(0.0, mid));
+            b.line_to(Point::new(w, mid));
+        });
+        frame.stroke(
+            &baseline,
+            Stroke::default()
+                .with_color(Color { a: 0.16, ..self.color })
+                .with_width(1.0),
+        );
+
+        // A small idle amplitude keeps the shape readable when silent; energy
+        // scales it towards (but never past) the edges.
+        let amp = (0.16 + 0.74 * self.energy.clamp(0.0, 1.0)) * (h * 0.42);
+        let phase = self.clock * self.speed;
+        let samples = 240;
+        let trace = Path::new(|b| {
+            for i in 0..=samples {
+                let x = i as f32 / samples as f32;
+                let y = self.waveform.shape(x * self.cycles + phase);
+                let point = Point::new(x * w, mid - y * amp);
+                if i == 0 {
+                    b.move_to(point);
+                } else {
+                    b.line_to(point);
+                }
+            }
+        });
+        frame.stroke(
+            &trace,
+            Stroke::default()
+                .with_color(self.color)
+                .with_width(2.0)
+                .with_line_cap(canvas::LineCap::Round),
+        );
+    }
+
+    // A fuller, spectrum-style bank of animated bars. There is no real FFT
+    // behind it — the bars are driven by the playing energy and an animated
+    // travelling shimmer, giving a lively "music visualiser" look.
+    fn draw_bars(&self, frame: &mut Frame) {
+        use std::f32::consts::PI;
+        let (w, h) = (frame.width(), frame.height());
+        let energy = self.energy.clamp(0.0, 1.0);
+
+        let bar_count = 28usize;
+        let gap = 3.0;
+        let bar_w = ((w - gap * (bar_count as f32 - 1.0)) / bar_count as f32).max(1.0);
+
+        for i in 0..bar_count {
+            let t = i as f32 / (bar_count as f32 - 1.0); // 0..1 across the width
+            // Travelling shimmer plus a gentle idle wobble so the bars are never
+            // completely still; an arch envelope keeps the edges shorter.
+            let shimmer = 0.5 + 0.5 * (self.clock * 3.0 * self.speed + t * PI * 5.0).sin();
+            let env = (PI * t).sin();
+            let idle = 0.10 + 0.06 * (self.clock * 1.5 + t * 6.0).sin().abs();
+            let frac = (idle + (0.12 + 0.88 * energy) * env * shimmer).clamp(0.02, 1.0);
+
+            let bar_h = frac * (h * 0.94);
+            let x = i as f32 * (bar_w + gap);
+            let rect = Path::rectangle(Point::new(x, h - bar_h), Size::new(bar_w, bar_h));
+            // Brighter towards the top of the taller bars.
+            let col = lerp(Color { a: 0.5, ..self.color }, self.color, frac);
+            frame.fill(&rect, col);
+        }
+    }
+}
+
+impl canvas::Program<Message> for Visualizer {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+        match self.style {
+            // `Off` never reaches here — the canvas isn't created in that case.
+            VisualizerStyle::Off | VisualizerStyle::Waveform => self.draw_waveform(&mut frame),
+            VisualizerStyle::Bars => self.draw_bars(&mut frame),
+        }
+        vec![frame.into_geometry()]
+    }
 }

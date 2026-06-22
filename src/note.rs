@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use strum_macros::Display;
+use serde::{Deserialize, Serialize};
 use rodio::{ChannelCount, Sample, SampleRate, Source};
 use crate::audio_mixer;
 
@@ -60,12 +61,72 @@ impl NoteLength {
     }
 }
 
+// The oscillator shape that gives each voice its character. `Organ` is the
+// original warm additive timbre (the default); the others are the classic
+// analogue-synth waveforms, from mellow to bright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Waveform {
+    #[default]
+    Organ,
+    Sine,
+    Triangle,
+    Sawtooth,
+    Square,
+}
+
+impl Waveform {
+    // Order shown in the picker: mellow at the top, brightest at the bottom.
+    pub const ALL: [Waveform; 5] = [
+        Waveform::Sine,
+        Waveform::Triangle,
+        Waveform::Organ,
+        Waveform::Sawtooth,
+        Waveform::Square,
+    ];
+
+    // The ideal shape of one cycle, sampled at `phase` (in 0.0..1.0), returned
+    // in roughly -1.0..=1.0. This is the unscaled mathematical shape used by the
+    // on-screen visualiser, so the curve matches the chosen sound.
+    pub fn shape(self, phase: f32) -> f32 {
+        let phase = phase.rem_euclid(1.0);
+        let theta = phase * TAU;
+        match self {
+            Waveform::Sine => theta.sin(),
+            Waveform::Triangle => 1.0 - 4.0 * (phase - 0.5).abs(),
+            Waveform::Sawtooth => 2.0 * phase - 1.0,
+            Waveform::Square => if theta.sin() >= 0.0 { 1.0 } else { -1.0 },
+            Waveform::Organ => {
+                let norm = 1.0 / HARMONICS.iter().sum::<f32>();
+                let mut value = 0.0;
+                for (index, harmonic) in HARMONICS.iter().enumerate() {
+                    let k = (index + 1) as f32;
+                    value += harmonic * (theta * k).sin();
+                }
+                value * norm
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Waveform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Waveform::Organ => "Organ",
+            Waveform::Sine => "Sine",
+            Waveform::Triangle => "Triangle",
+            Waveform::Sawtooth => "Sawtooth",
+            Waveform::Square => "Square",
+        })
+    }
+}
+
 // Synthesis parameters shared by every voice, sourced from the user's settings.
 #[derive(Debug, Clone, Copy)]
 pub struct ToneSettings {
     pub attack_ms: u32,
     pub release_ms: u32,
     pub gain: f32,
+    pub waveform: Waveform,
 }
 
 // A single synthesised voice: a bank of harmonics shaped by an attack/sustain/
@@ -81,6 +142,7 @@ pub struct Voice {
     amplitude: f32,
     phase: f32,
     norm: f32,
+    waveform: Waveform,
 
     attack_samples: u32,
     release_samples: u32,
@@ -112,6 +174,7 @@ impl Voice {
             amplitude,
             phase: 0.0,
             norm,
+            waveform: settings.waveform,
             attack_samples,
             release_samples,
             elapsed: 0,
@@ -130,6 +193,31 @@ impl Voice {
             self.elapsed as f32 / self.attack_samples as f32
         } else {
             1.0
+        }
+    }
+
+    // The bare oscillator value (roughly -1.0..=1.0) for the current phase,
+    // shaped by the selected waveform. Brighter waveforms are scaled down a
+    // touch so switching between them doesn't jump in perceived loudness.
+    fn oscillator(&self) -> f32 {
+        let phase = self.phase;
+        match self.waveform {
+            Waveform::Organ => {
+                // Additive synthesis: sum the fundamental and its harmonics.
+                let mut value = 0.0;
+                for (index, harmonic) in HARMONICS.iter().enumerate() {
+                    let k = (index + 1) as f32;
+                    value += harmonic * (phase * k).sin();
+                }
+                value * self.norm
+            }
+            Waveform::Sine => phase.sin() * 0.9,
+            Waveform::Triangle => {
+                let t = phase / TAU; // 0.0..1.0
+                (1.0 - 4.0 * (t - 0.5).abs()) * 0.85
+            }
+            Waveform::Sawtooth => (2.0 * (phase / TAU) - 1.0) * 0.5,
+            Waveform::Square => if phase.sin() >= 0.0 { 0.45 } else { -0.45 },
         }
     }
 
@@ -167,13 +255,7 @@ impl Iterator for Voice {
             self.pre_release_level()
         };
 
-        // Additive synthesis: sum the fundamental and its harmonics.
-        let mut value = 0.0;
-        for (index, harmonic) in HARMONICS.iter().enumerate() {
-            let k = (index + 1) as f32;
-            value += harmonic * (self.phase * k).sin();
-        }
-        let sample = value * self.norm * self.amplitude * envelope;
+        let sample = self.oscillator() * self.amplitude * envelope;
 
         self.phase += TAU * self.frequency / SAMPLE_RATE as f32;
         if self.phase >= TAU {
